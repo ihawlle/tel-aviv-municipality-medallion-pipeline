@@ -17,7 +17,7 @@ resources:
         - task_key: run_medallion_pipeline
           environment_key: default
           spark_python_task:
-            python_file: ./tel-aviv-municipality-medallion-pipeline/src/pipeline/main.py
+            python_file: ./src/pipeline/main.py
       schedule:
         quartz_cron_expression: "0 0 3 * * ?"
         timezone_id: "Asia/Jerusalem"
