@@ -2,23 +2,57 @@
 
 PySpark Medallion pipeline for Tel Aviv municipality data (street closures CSV + ArcGIS businesses API), including Bronze/Silver/Gold tables, 2023 compensation outputs, audit table, scheduler job config, and dashboard-ready metrics.
 
+## Prerequisites & Tech Stack
+
+- Python 3.10+
+- Databricks Runtime (Spark 3.x)
+- Snowflake Account
+- Looker Studio (for visualization)
+
 ## Architecture
+
+```mermaid
+flowchart LR
+    subgraph sources [Sources]
+        CSV[Street Closures CSV]
+        ArcGIS[ArcGIS API]
+    end
+
+    subgraph databricks [Databricks]
+        Bronze[Bronze]
+        Silver[Silver]
+        Gold[Gold]
+    end
+
+    subgraph downstream [Downstream]
+        Snowflake[Snowflake]
+        Looker[Looker Studio]
+    end
+
+    CSV --> Bronze
+    ArcGIS --> Bronze
+    Bronze --> Silver
+    Silver --> Gold
+    Gold --> Snowflake
+    Snowflake --> Looker
+```
 
 - **Bronze**
   - `medallion.bronze_street_closures`
   - `medallion.bronze_businesses_features`
-  - `medallion.bronze_businesses_pages`
   - `medallion.bronze_street_segments`
 - **Silver**
   - `medallion.silver_street_closures_daily`
   - `medallion.silver_street_segments`
   - `medallion.silver_businesses`
 - **Gold**
-  - `medallion.gold_business_daily_compensation_2023`
   - `medallion.gold_business_annual_compensation_2023`
   - `medallion.gold_street_annual_compensation_2023`
-  - `medallion.gold_unmatched_closures_audit_2023`
   - `medallion.gold_dashboard_metrics_2023`
+  - `medallion.gold_payout_assignment_2023`
+  - `medallion.gold_payout_precision_2023`
+  - `medallion.gold_audit_assignment_unmatched`
+  - `medallion.gold_audit_precision_unmatched`
 
 ## Key business logic implemented
 
@@ -27,7 +61,7 @@ PySpark Medallion pipeline for Tel Aviv municipality data (street closures CSV +
 - Daily compensation formula:
   - `least(10000, shetach * 100)`
 - Street matching uses `create_street_signature`:
-  - remove non-Hebrew chars and numbers
+  - retain Hebrew and digits; remove other characters
   - split to words
   - sort tokens
   - join to canonical street signature
@@ -49,8 +83,7 @@ PySpark Medallion pipeline for Tel Aviv municipality data (street closures CSV +
   - Bronze source outputs
   - Silver normalized outputs
   - Gold final outputs
-- Gold unmatched-closures audit table captures 2023 closure street-days with no matching business street signature.
-- Audit also includes `OUTSIDE_SPATIAL_IMPACT_ZONE` rows with `assigned_segment_id` and `distance_to_closure_segment_m`.
+- Gold audit tables (`gold_audit_assignment_unmatched`, `gold_audit_precision_unmatched`) capture 2023 closures that did not result in payout, with detailed `audit_reason` (e.g. `INVALID_SOURCE_DATA`, `STREET_NOT_FOUND_IN_BUSINESS_DB`, `OUTSIDE_SPATIAL_IMPACT_ZONE`, `MATCHED_STREET_BUT_NO_ELIGIBLE_BUSINESSES`).
 
 ## GIS API (Layer 507) – getting geometry
 
@@ -127,35 +160,35 @@ Run in Databricks SQL / Spark SQL:
 
 ```sql
 -- 1) 2023 filter check
-SELECT MIN(compensation_date), MAX(compensation_date)
-FROM medallion.gold_business_daily_compensation_2023;
+SELECT MIN(date), MAX(date)
+FROM medallion.gold_payout_precision_2023;
 ```
 
 ```sql
 -- 2) Daily cap check
-SELECT MAX(daily_compensation_ils) AS max_daily_comp
-FROM medallion.gold_business_daily_compensation_2023;
+SELECT MAX(payout_ils) AS max_daily_comp
+FROM medallion.gold_payout_precision_2023;
 ```
 
 ```sql
 -- 3) No duplicate compensation per business/day
-SELECT business_id, compensation_date, COUNT(*) AS c
-FROM medallion.gold_business_daily_compensation_2023
-GROUP BY business_id, compensation_date
+SELECT business_id, date, COUNT(*) AS c
+FROM medallion.gold_payout_precision_2023
+GROUP BY business_id, date
 HAVING COUNT(*) > 1;
 ```
 
 ```sql
 -- 4) Unmatched closures audit coverage
 SELECT COUNT(*) AS unmatched_rows
-FROM medallion.gold_unmatched_closures_audit_2023;
+FROM medallion.gold_audit_assignment_unmatched;
 ```
 
 ```sql
--- 5) Spatial filtering reasons
-SELECT failure_reason, COUNT(*) AS rows_count
-FROM medallion.gold_unmatched_closures_audit_2023
-GROUP BY failure_reason
+-- 5) Audit reason distribution
+SELECT audit_reason, COUNT(*) AS rows_count
+FROM medallion.gold_audit_assignment_unmatched
+GROUP BY audit_reason
 ORDER BY rows_count DESC;
 ```
 
@@ -167,6 +200,18 @@ SELECT "street_annual" AS dataset, COUNT(*) AS c FROM medallion.gold_street_annu
 UNION ALL
 SELECT "dashboard" AS dataset, COUNT(*) AS c FROM medallion.gold_dashboard_metrics_2023;
 ```
+
+## BI & Dashboarding
+
+The final Gold tables (`gold_dashboard_metrics_2023`, `gold_payout_assignment_2023`, `gold_payout_precision_2023`, and the audit tables) are exported to Snowflake and connected to **Looker Studio** for visualization.
+
+Municipal decision-makers use the dashboard to:
+
+- **Visualize compensation distribution** across streets and businesses
+- **Compare Precision vs. Assignment models** (segment-based vs. street-signature-based eligibility)
+- **Perform root-cause analysis** on unmatched closures using the audit tables (`gold_audit_assignment_unmatched`, `gold_audit_precision_unmatched`)
+
+[Insert Screenshot of Looker Studio Dashboard Here]
 
 ## Dashboard spec (bonus)
 
@@ -187,3 +232,11 @@ Suggested visuals:
 - Spatial calculations are performed in ITM Cartesian coordinates (no WGS84 transformation).
 - Businesses table is treated as latest known state and not time-sliced historically.
 - Unmatched closure audit flags potential data gaps and spatial filtering outcomes.
+
+## Future Enhancements & Optimizations
+
+- **Spark Native Snowflake Connector:** The pipeline currently uses `.toPandas()` for Snowflake export, which works for the Tel Aviv dataset but would cause Out-Of-Memory (OOM) errors at national scale. Moving to the native Spark Snowflake connector will enable distributed writes and horizontal scaling.
+
+- **Audit Logic Refactoring:** Continue abstracting and modularizing the PySpark `F.when().otherwise()` logic (e.g. via the existing `_audit_reason_column` helper) to maintain DRY principles as more audit reasons are added.
+
+- **Incremental Processing:** For larger datasets, consider checkpointing and incremental Delta reads to avoid full table scans on each run.
