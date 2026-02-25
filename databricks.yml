@@ -1,0 +1,42 @@
+# This is a Databricks asset bundle definition for tel-aviv-municipality-medallion-pipeline.
+# The Databricks extension requires databricks.yml configuration file.
+# See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
+
+bundle:
+  name: tel-aviv-municipality-medallion-pipeline
+
+resources:
+  jobs:
+    medallion_pipeline_job:
+      name: tel-aviv-medallion-pipeline-job
+      environments:
+        - environment_key: default
+          spec:
+            client: "1"
+      tasks:
+        - task_key: run_medallion_pipeline
+          environment_key: default
+          spark_python_task:
+            python_file: ./tel-aviv-municipality-medallion-pipeline/src/pipeline/main.py
+      schedule:
+        quartz_cron_expression: "0 0 3 * * ?"
+        timezone_id: "Asia/Jerusalem"
+        pause_status: "PAUSED"
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://dbc-fae25079-a5f4.cloud.databricks.com
+    resources:
+      jobs:
+        medallion_pipeline_job:
+          schedule:
+            pause_status: "UNPAUSED"
+
+  ## Optionally, there could be 'staging' or 'prod' targets here.
+  #
+  # prod:
+  #   workspace:
+  #     host: https://dbc-fae25079-a5f4.cloud.databricks.com
