@@ -346,30 +346,33 @@ def build_silver_businesses(
     """Flatten businesses and enrich each business with a best-matching street segment."""
     base_df = _build_silver_businesses_base(spark=spark, bronze_business_features_table=bronze_business_features_table)
 
+    segments_filtered = silver_segments_df.select(
+        "segment_id",
+        "k_rechov",
+        F.col("street_signature").alias("segment_street_signature"),
+        "paths_array",
+        "shape_length_m",
+        "left_from",
+        "left_to",
+        "right_from",
+        "right_to",
+        "segment_mid_x",
+        "segment_mid_y",
+    )
     b = base_df.alias("b")
-    s = F.broadcast(
-        silver_segments_df.select(
-            "segment_id",
-            "k_rechov",
-            "street_signature",
-            "paths_array",
-            "shape_length_m",
-            "left_from",
-            "left_to",
-            "right_from",
-            "right_to",
-            "segment_mid_x",
-            "segment_mid_y",
-        ).alias("s")
+    s = F.broadcast(segments_filtered.alias("s"))
+
+    # Two parallel Hash Joins (avoids Nested Loop Join); row_number() handles deduplication
+    join_on_k_rechov = F.col("b.business_k_rechov").cast("string") == F.col("s.k_rechov")
+    join_on_street_sig = (
+        F.col("b.street_signature").isNotNull()
+        & (F.trim(F.coalesce(F.col("b.street_signature"), F.lit(""))) != "")
+        & (F.col("b.street_signature") != "0")
+        & (F.col("b.street_signature") == F.col("s.segment_street_signature"))
     )
 
-    prefilter_condition = (
-        (F.col("b.business_k_rechov").isNotNull() & (F.col("b.business_k_rechov").cast("string") == F.col("s.k_rechov")))
-        | (F.col("b.street_signature") == F.col("s.street_signature"))
-    )
-
-    candidates_df = (
-        b.join(s, on=prefilter_condition, how="left")
+    candidates_a = (
+        b.join(s, on=join_on_k_rechov, how="left")
         .withColumn(
             "segment_distance_polyline_m",
             point_to_polyline_distance_m(F.col("b.x_coord"), F.col("b.y_coord"), F.col("s.paths_array")),
@@ -413,6 +416,52 @@ def build_silver_businesses(
             .otherwise(F.lit(4)),
         )
     )
+    candidates_b = (
+        b.join(s, on=join_on_street_sig, how="left")
+        .withColumn(
+            "segment_distance_polyline_m",
+            point_to_polyline_distance_m(F.col("b.x_coord"), F.col("b.y_coord"), F.col("s.paths_array")),
+        )
+        .withColumn(
+            "segment_distance_midpoint_m",
+            euclidean_distance_m(
+                F.col("b.x_coord"),
+                F.col("b.y_coord"),
+                F.col("s.segment_mid_x"),
+                F.col("s.segment_mid_y"),
+            ),
+        )
+        .withColumn(
+            "segment_distance_m",
+            F.coalesce(F.col("segment_distance_polyline_m"), F.col("segment_distance_midpoint_m")),
+        )
+        .withColumn(
+            "house_range_match",
+            (
+                (
+                    F.col("b.house_number_int").between(F.col("s.left_from"), F.col("s.left_to"))
+                    & F.col("s.left_from").isNotNull()
+                    & F.col("s.left_to").isNotNull()
+                )
+                | (
+                    F.col("b.house_number_int").between(F.col("s.right_from"), F.col("s.right_to"))
+                    & F.col("s.right_from").isNotNull()
+                    & F.col("s.right_to").isNotNull()
+                )
+            ),
+        )
+        .withColumn("segment_is_long", F.coalesce(F.col("s.shape_length_m"), F.lit(0.0)) >= F.lit(long_segment_threshold_m))
+        .withColumn(
+            "segment_priority",
+            F.when(F.col("s.segment_id").isNull(), F.lit(99))
+            .when(F.col("segment_is_long") & F.col("house_range_match"), F.lit(0))
+            .when(F.col("house_range_match"), F.lit(1))
+            .when(F.col("segment_distance_m") <= F.lit(max_segment_distance_m), F.lit(2))
+            .when(F.col("segment_distance_m") <= F.lit(max_segment_fallback_distance_m), F.lit(3))
+            .otherwise(F.lit(4)),
+        )
+    )
+    candidates_df = candidates_a.unionByName(candidates_b, allowMissingColumns=True)
 
     rank_window = Window.partitionBy(F.col("b.business_id")).orderBy(
         F.col("segment_priority").asc(),
@@ -426,7 +475,7 @@ def build_silver_businesses(
             F.col("b.business_id").alias("business_id"),
             F.when(F.col("segment_priority") <= F.lit(3), F.col("s.segment_id")).alias("assigned_segment_id"),
             F.when(F.col("segment_priority") <= F.lit(3), F.col("s.k_rechov")).alias("assigned_segment_k_rechov"),
-            F.when(F.col("segment_priority") <= F.lit(3), F.col("s.street_signature")).alias("assigned_segment_street_signature"),
+            F.when(F.col("segment_priority") <= F.lit(3), F.col("s.segment_street_signature")).alias("assigned_segment_street_signature"),
             F.when(F.col("segment_priority") <= F.lit(3), F.col("segment_distance_m")).alias("segment_distance_m"),
             F.when(
                 F.col("segment_priority") <= F.lit(1),
@@ -499,6 +548,9 @@ def run_silver_layer(
         table_name=cfg.silver_street_segments_table,
         table_path=segments_output_path,
     )
+    spark.sql(f"OPTIMIZE {cfg.silver_businesses_table} ZORDER BY (business_id)")
+    for table in [cfg.silver_street_daily_table, cfg.silver_businesses_table, cfg.silver_street_segments_table]:
+        spark.sql(f"ANALYZE TABLE {table} COMPUTE STATISTICS FOR ALL COLUMNS")
 
     return {
         "street_closures_silver": silver_street_daily_df,

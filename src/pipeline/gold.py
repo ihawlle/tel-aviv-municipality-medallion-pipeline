@@ -342,11 +342,23 @@ def _build_gold_daily_compensation(
     daily_rate_ils: float,
     daily_cap_ils: float,
 ) -> DataFrame:
+    businesses_pruned = silver_businesses_df.select(
+        "business_id",
+        "assigned_segment_id",
+        "street_name_raw",
+        "house_number",
+        "business_usage",
+        "shetach",
+        "x_coord",
+        "y_coord",
+        "geometry_json",
+        "segment_distance_m",
+    )
     joined_df = (
-        impacted_segments_df.withColumn("segment_id_str", F.col("segment_id").cast("string")).alias("i")
+        F.broadcast(impacted_segments_df).alias("i")
         .join(
-            silver_businesses_df.withColumn("assigned_segment_id_str", F.col("assigned_segment_id").cast("string")).alias("b"),
-            on=F.col("i.segment_id_str") == F.col("b.assigned_segment_id_str"),
+            businesses_pruned.alias("b"),
+            on=F.col("i.segment_id") == F.col("b.assigned_segment_id"),
             how="inner",
         )
         .select(
@@ -404,6 +416,8 @@ def _build_gold_payout_assignment_2023(
     ).filter(
         F.trim(F.coalesce(F.col("street_signature"), F.lit(""))) != ""
     ).filter(
+        F.col("street_signature") != "0"
+    ).filter(
         F.trim(F.coalesce(F.col("street_name_raw"), F.lit(""))) != ""
     )
 
@@ -441,7 +455,9 @@ def _build_gold_payout_assignment_2023(
                 F.concat(F.lit("Business #"), F.col("b.business_id").cast("string")),
             ).alias("business_name"),
             F.col("b.street_name_raw").alias("street_name"),
+            F.col("b.street_name_raw").alias("street_name_raw"),
             F.col("b.shetach").cast("double").alias("shetach"),
+            F.col("b.holder_name").alias("holder_name"),
             F.col("s.t_sug").alias("closure_category"),
             F.col("s.closure_duration_sec"),
             F.col("s.closure_id"),
@@ -469,8 +485,8 @@ def _build_gold_payout_assignment_2023(
         "is_capped",
         F.col("payout_ils") >= F.lit(daily_cap_ils),
     ).select(
-        "date", "business_id", "business_name", "street_name", "payout_ils", "is_capped", "closure_category",
-        "closure_id", "business_usage", "x_coord", "y_coord",
+        "date", "business_id", "business_name", "street_name", "street_name_raw", "payout_ils", "is_capped",
+        "closure_category", "closure_id", "business_usage", "shetach", "holder_name", "x_coord", "y_coord",
     )
 
 
@@ -487,6 +503,8 @@ def _build_gold_payout_precision_2023(
         F.col("street_signature").isNotNull()
     ).filter(
         F.trim(F.coalesce(F.col("street_signature"), F.lit(""))) != ""
+    ).filter(
+        F.col("street_signature") != "0"
     ).filter(
         F.trim(F.coalesce(F.col("street_name_raw"), F.lit(""))) != ""
     )
@@ -506,27 +524,35 @@ def _build_gold_payout_precision_2023(
         F.unix_timestamp(F.col("closure_end_ts")) - F.unix_timestamp(F.col("closure_start_ts")),
     )
 
+    closure_2023_pruned = closure_2023_df.select(
+        "closure_id",
+        "affected_date",
+        "t_sug",
+        "closure_duration_sec",
+    )
     impacted_with_closure_df = impacted_segments_df.join(
-        closure_2023_df.select(
-            "closure_id",
-            "affected_date",
-            "t_sug",
-            "closure_duration_sec",
-        ),
+        F.broadcast(closure_2023_pruned),
         on=["closure_id", "affected_date"],
         how="left",
     )
 
+    # Column pruning: keep only columns needed for join and output (segment_id/assigned_segment_id already StringType)
+    businesses_for_join = businesses_filtered.select(
+        "business_id",
+        "assigned_segment_id",
+        "holder_name",
+        "business_display_name",
+        "street_name_raw",
+        "shetach",
+        "business_usage",
+        "x_coord",
+        "y_coord",
+    )
     joined_df = (
-        impacted_with_closure_df.withColumn(
-            "segment_id_str", F.col("segment_id").cast("string")
-        )
-        .alias("i")
+        F.broadcast(impacted_with_closure_df).alias("i")
         .join(
-            businesses_filtered.withColumn(
-                "assigned_segment_id_str", F.col("assigned_segment_id").cast("string")
-            ).alias("b"),
-            on=F.col("i.segment_id_str") == F.col("b.assigned_segment_id_str"),
+            businesses_for_join.alias("b"),
+            on=F.col("i.segment_id") == F.col("b.assigned_segment_id"),
             how="inner",
         )
         .filter(~_is_municipal(F.col("b.holder_name")))
@@ -539,7 +565,9 @@ def _build_gold_payout_precision_2023(
                 F.concat(F.lit("Business #"), F.col("b.business_id").cast("string")),
             ).alias("business_name"),
             F.col("b.street_name_raw").alias("street_name"),
+            F.col("b.street_name_raw").alias("street_name_raw"),
             F.col("b.shetach").cast("double").alias("shetach"),
+            F.col("b.holder_name").alias("holder_name"),
             F.col("i.t_sug").alias("closure_category"),
             F.col("i.closure_duration_sec"),
             F.col("i.closure_id"),
@@ -567,8 +595,8 @@ def _build_gold_payout_precision_2023(
         "is_capped",
         F.col("payout_ils") >= F.lit(daily_cap_ils),
     ).select(
-        "date", "business_id", "business_name", "street_name", "payout_ils", "is_capped", "closure_category",
-        "closure_id", "business_usage", "x_coord", "y_coord",
+        "date", "business_id", "business_name", "street_name", "street_name_raw", "payout_ils", "is_capped",
+        "closure_category", "closure_id", "business_usage", "shetach", "holder_name", "x_coord", "y_coord",
     )
 
 
@@ -593,8 +621,13 @@ def _build_gold_audit_assignment_unmatched(
         .dropDuplicates(["closure_id", "affected_date", "street_signature"])
     )
 
+    _valid_street_sig = (
+        F.col("street_signature").isNotNull()
+        & (F.trim(F.coalesce(F.col("street_signature"), F.lit(""))) != "")
+        & (F.col("street_signature") != "0")
+    )
     business_street_counts_df = (
-        silver_businesses_df.filter(F.col("street_signature").isNotNull())
+        silver_businesses_df.filter(_valid_street_sig)
         .groupBy("street_signature")
         .agg(F.countDistinct("business_id").alias("businesses_on_street"))
     )
@@ -720,8 +753,13 @@ def _build_gold_audit_precision_unmatched(
         )
     )
 
+    _valid_street_sig = (
+        F.col("street_signature").isNotNull()
+        & (F.trim(F.coalesce(F.col("street_signature"), F.lit(""))) != "")
+        & (F.col("street_signature") != "0")
+    )
     business_street_counts_df = (
-        silver_businesses_df.filter(F.col("street_signature").isNotNull())
+        silver_businesses_df.filter(_valid_street_sig)
         .groupBy("street_signature")
         .agg(F.countDistinct("business_id").alias("businesses_on_street"))
     )
@@ -732,7 +770,7 @@ def _build_gold_audit_precision_unmatched(
             all_closures_2023, on=["closure_id", "affected_date"], how="inner"
         )
         .join(
-            business_street_counts_df.alias("bsc"),
+            F.broadcast(business_street_counts_df).alias("bsc"),
             F.col("main_street_signature") == F.col("bsc.street_signature"),
             how="left",
         )
@@ -741,16 +779,16 @@ def _build_gold_audit_precision_unmatched(
             F.col("bsc.businesses_on_street"),
         )
     )
+    businesses_audit_pruned = silver_businesses_df.select(
+        "business_id",
+        "assigned_segment_id",
+        "holder_name",
+    )
     left_joined = (
-        impacted_with_t_sug.withColumn(
-            "segment_id_str", F.col("segment_id").cast("string")
-        )
-        .alias("i")
+        F.broadcast(impacted_with_t_sug).alias("i")
         .join(
-            silver_businesses_df.withColumn(
-                "assigned_segment_id_str", F.col("assigned_segment_id").cast("string")
-            ).alias("b"),
-            on=F.col("i.segment_id_str") == F.col("b.assigned_segment_id_str"),
+            businesses_audit_pruned.alias("b"),
+            on=F.col("i.segment_id") == F.col("b.assigned_segment_id"),
             how="left",
         )
         .withColumn("is_municipal", _is_municipal(F.col("b.holder_name")))
@@ -1094,6 +1132,16 @@ def run_gold_layer(
     spark.sql(
         f"OPTIMIZE {getattr(cfg, 'gold_audit_precision_unmatched_table', _DEFAULT_AUDIT_PRECISION_UNMATCHED_TABLE)} ZORDER BY (date)"
     )
+    for table in [
+        cfg.gold_business_annual_table,
+        cfg.gold_street_annual_table,
+        cfg.gold_dashboard_metrics_table,
+        cfg.gold_payout_assignment_table,
+        cfg.gold_payout_precision_table,
+        getattr(cfg, "gold_audit_assignment_unmatched_table", _DEFAULT_AUDIT_ASSIGNMENT_UNMATCHED_TABLE),
+        getattr(cfg, "gold_audit_precision_unmatched_table", _DEFAULT_AUDIT_PRECISION_UNMATCHED_TABLE),
+    ]:
+        spark.sql(f"ANALYZE TABLE {table} COMPUTE STATISTICS FOR ALL COLUMNS")
 
     return {
         "business_annual_gold": gold_business_annual_df,
